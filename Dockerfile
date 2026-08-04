@@ -63,9 +63,9 @@ COPY docs/CLAUDE_PROMPT.md docs/ENVIRONMENT_VARIABLES.md docs/INTERNALS.md docs/
 COPY README.md ./README.md
 COPY CHANGELOG.md ./CHANGELOG.md
 
-# Persistent mount point: bucket data
-# 持久化挂载点：记忆数据
-VOLUME ["/app/buckets"]
+# 持久化数据目录由运行平台或 docker-compose 显式挂载。
+# 不在镜像中声明 Docker VOLUME：Railway 会拒绝包含 VOLUME 指令的 Dockerfile，
+# 而生产环境已经将 Railway Volume 挂载到 /app/buckets。
 
 # Default to streamable-http for container (remote access)
 # 容器场景默认用 streamable-http
