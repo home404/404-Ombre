@@ -25,20 +25,14 @@ jobs:
           python -m pip install "uv==0.11.23"
           uv pip sync requirements-dev.lock.txt --require-hashes --system
 
-      - name: Compile changed runtime files
-        run: |
-          python -m compileall -q \
-            src/ombrebrain/policy/owner_purge.py \
-            src/ombrebrain/projection/projection_mirror.py \
-            src/tools/trace/__init__.py
+      - name: Compile runtime
+        run: python -m compileall -q src
 
-      - name: Run focused static checks
-        run: |
-          ruff check \
-            src/ombrebrain/policy/owner_purge.py \
-            src/ombrebrain/projection/projection_mirror.py \
-            src/tools/trace/__init__.py \
-            tests/test_owner_purge.py
+      - name: Run full static checks
+        run: ruff check src tools deploy tests --no-cache
 
       - name: Run owner purge regressions
         run: python -m pytest tests/test_owner_purge.py -q --asyncio-mode=auto
+
+      - name: Run full local suite
+        run: python -m pytest tests -q --asyncio-mode=auto
