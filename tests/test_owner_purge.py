@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import os
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -260,9 +259,7 @@ async def test_owner_purge_removes_truth_media_vector_and_unshared_source(
 
     events = list(manager.ledger_mirror.iter_events())
     assert events[-1]["event_type"] == "TraceOwnerPurged"
-    assert events[-1]["body_hash"] == hashlib.sha256(b"").hexdigest().join(
-        ["sha256:", ""]
-    )
+    assert events[-1]["body_hash"] == f"sha256:{hashlib.sha256(b'').hexdigest()}"
     assert events[-1]["payload"]["content_erased"] is True
     assert "secret" not in str(events[-1])
 
