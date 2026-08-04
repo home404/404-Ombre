@@ -31,6 +31,12 @@ class TraceCatalogProjection:
         if not trace_id:
             self.unknown_event_count += 1
             return
+        if event_type == "TraceOwnerPurged":
+            # Owner purge is stronger than a tombstone: no searchable shadow
+            # row remains, while the content-free ledger receipt preserves the
+            # fact that an authorized erasure happened.
+            self.traces.pop(trace_id, None)
+            return
         if event_type == "TraceCreated":
             self.traces[trace_id] = _base_trace(event)
             return
