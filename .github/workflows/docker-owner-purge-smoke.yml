@@ -1,0 +1,161 @@
+name: Docker MCP owner-purge smoke
+
+on:
+  pull_request:
+    branches:
+      - production
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  docker-owner-purge-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build production Docker image
+        run: |
+          docker build \
+            --build-arg INSTALL_CLOUDFLARED=0 \
+            --tag ombre-owner-purge-smoke:${{ github.sha }} \
+            .
+
+      - name: Prepare isolated smoke vault
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          root = Path(".smoke-vault")
+          (root / "archive" / "smoke").mkdir(parents=True, exist_ok=True)
+          (root / "dynamic" / "smoke").mkdir(parents=True, exist_ok=True)
+          (root / "_media" / "smoke-delete-001").mkdir(parents=True, exist_ok=True)
+          (root / "_sources").mkdir(parents=True, exist_ok=True)
+
+          config = Path("config.example.yaml").read_text(encoding="utf-8")
+          needle = "embedding:\n  enabled: true"
+          if needle not in config:
+              raise SystemExit("Could not locate embedding.enabled in config.example.yaml")
+          config = config.replace(
+              needle,
+              "embedding:\n  enabled: false",
+              1,
+          )
+          config = config.replace(
+              "  background_indexing: true",
+              "  background_indexing: false",
+              1,
+          )
+          (root / "config.yaml").write_text(config, encoding="utf-8")
+
+          unique_ref = "src_" + "a" * 64
+          shared_ref = "src_" + "b" * 64
+
+          target = f"""---
+          id: smoke-delete-001
+          name: Docker owner purge smoke target
+          type: dynamic
+          domain:
+            - smoke
+          tags:
+            - smoke
+          importance: 5
+          valence: 0
+          arousal: 0
+          source_refs:
+            - ref: {unique_ref}
+              ranges: []
+            - ref: {shared_ref}
+              ranges: []
+          ---
+
+          SMOKE_PURGE_SECRET_7f4e6c1b
+          """
+          control = f"""---
+          id: smoke-control-001
+          name: Docker owner purge smoke control
+          type: dynamic
+          domain:
+            - smoke
+          tags:
+            - smoke
+          importance: 5
+          valence: 0
+          arousal: 0
+          source_refs:
+            - ref: {shared_ref}
+              ranges: []
+          ---
+
+          SMOKE_CONTROL_CONTENT
+          """
+          (root / "archive" / "smoke" / "smoke-delete-001.md").write_text(
+              target,
+              encoding="utf-8",
+          )
+          (root / "dynamic" / "smoke" / "smoke-control-001.md").write_text(
+              control,
+              encoding="utf-8",
+          )
+          (root / "_media" / "smoke-delete-001" / "asset.bin").write_bytes(
+              b"smoke-media"
+          )
+          (root / "_sources" / f"{unique_ref}.source").write_bytes(
+              b"unique smoke source"
+          )
+          (root / "_sources" / f"{shared_ref}.source").write_bytes(
+              b"shared smoke source"
+          )
+          PY
+
+      - name: Start container and exercise MCP purge path
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          container="ombre-owner-purge-smoke"
+          cleanup() {
+            docker rm -f "$container" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker run --detach \
+            --name "$container" \
+            --publish 18001:8000 \
+            --volume "$PWD/.smoke-vault:/app/buckets" \
+            --env OMBRE_BUCKETS_DIR=/app/buckets \
+            --env OMBRE_CONFIG_PATH=/app/buckets/config.yaml \
+            --env OMBRE_TRANSPORT=streamable-http \
+            --env OMBRE_PORT=8000 \
+            --env OMBRE_BIND_HOST=0.0.0.0 \
+            --env OMBRE_COMPRESS_API_KEY=smoke-dummy-key \
+            --env OMBRE_COMPRESS_BASE_URL=http://127.0.0.1:9/v1 \
+            --env OMBRE_COMPRESS_MODEL=smoke-dummy-model \
+            --env OMBRE_MCP_REQUIRE_AUTH=true \
+            --env OMBRE_MCP_AUTH_MODE=token \
+            --env OMBRE_MCP_TOKEN=smoke-owner-purge-token \
+            --env OMBRE_DASHBOARD_PASSWORD=smoke-dashboard-password \
+            --env OMBRE_ALLOW_OWNER_PURGE=true \
+            --env AI_NAME=G-smoke \
+            ombre-owner-purge-smoke:${{ github.sha }}
+
+          if ! python tests/docker_owner_purge_smoke.py \
+            --token smoke-owner-purge-token \
+            --vault .smoke-vault; then
+            echo "::group::Ombre container logs"
+            docker logs "$container" || true
+            echo "::endgroup::"
+            exit 1
+          fi
+
+          echo "::group::Ombre container log tail"
+          docker logs --tail 120 "$container" || true
+          echo "::endgroup::"
