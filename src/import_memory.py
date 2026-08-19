@@ -34,11 +34,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from tools._common import (
-    _HIGH_IMP_THRESHOLD,
-    _quota_turn,
-    enforce_high_importance_quota,
-)
+from errors import safe_error_detail
+from tools.plan.core import is_letter_bucket
 from utils import atomic_write_text, clean_llm_json, count_tokens_approx, now_iso, parse_bool
 
 logger = logging.getLogger("ombre_brain.import")
@@ -68,6 +65,7 @@ _CHUNK_ERR_PREVIEW = 200       # 单 chunk 错误信息截断长度
 _EXTRACT_TOKEN_CEILING = _CHUNK_TARGET_TOKENS
 _EXTRACT_MAX_TOKENS = 2048
 _EXTRACT_MAX_ITEMS = 5         # 提示词之外再做强制写入上限
+_STRUCTURED_IMPORT_MAX_ITEMS = 10000  # 人工整理 JSON 的单文件安全上限
 _EXTRACT_TEMPERATURE = 0.0     # 提取需确定性
 _PARSE_ERR_PREVIEW = 200       # JSON 解析失败时日志预览
 
@@ -116,17 +114,12 @@ _IMPORT_ERROR_RULES = (
 
 
 def _safe_import_error_detail(exc: BaseException) -> str:
-    """Return a bounded provider error while redacting common credential forms."""
+    """导入侧的异常脱敏，实现已上移到 errors.safe_error_detail。
 
-    detail = str(exc).strip() or type(exc).__name__
-    detail = re.sub(r"(?i)(bearer\s+)[^\s,;]+", r"\1[REDACTED]", detail)
-    detail = re.sub(r"\bsk-[A-Za-z0-9_-]{8,}\b", "[REDACTED]", detail)
-    detail = re.sub(
-        r"(?i)((?:api[_-]?key|token)\s*[=:]\s*)[^\s,;]+",
-        r"\1[REDACTED]",
-        detail,
-    )
-    return detail[:_CHUNK_ERR_PREVIEW]
+    保留这个名字是因为导入流水线内部已有多处调用（以及针对它的回归测试）；
+    真正的脱敏规则只维护 errors.py 一份，避免两处正则各自漂移。
+    """
+    return safe_error_detail(exc)
 
 
 def diagnose_import_errors(errors: list[object]) -> list[dict[str, str]]:
@@ -218,11 +211,84 @@ def _prepare_import(
     """CPU/memory-heavy parsing entry point run outside the event loop."""
 
     source_hash = _source_hash(human_label, raw_content)
+    direct_items = _parse_structured_memory_json(raw_content, filename)
+    if direct_items is not None:
+        return (
+            source_hash,
+            len(direct_items),
+            [{"direct_item": item} for item in direct_items],
+        )
     turns = detect_and_parse(raw_content, filename)
     turns_count = len(turns)
     chunks = chunk_turns(turns, human_label=human_label) if turns else []
     turns.clear()
     return source_hash, turns_count, chunks
+
+
+def _parse_structured_memory_json(
+    raw_content: str,
+    filename: str = "",
+) -> list[dict] | None:
+    """Recognize user-authored memory JSON without sending it through an LLM."""
+
+    if Path(filename).suffix.lower() != ".json" and _first_non_whitespace(
+        raw_content
+    ) not in {"[", "{"}:
+        return None
+    try:
+        payload = json.loads(raw_content)
+    except (json.JSONDecodeError, TypeError, RecursionError):
+        return None
+
+    explicit_wrapper = isinstance(payload, dict) and "items" in payload
+    if explicit_wrapper:
+        candidates = payload.get("items")
+    elif isinstance(payload, list):
+        candidates = payload
+    elif isinstance(payload, dict) and "content" in payload:
+        candidates = [payload]
+    else:
+        return None
+
+    if not isinstance(candidates, list):
+        if explicit_wrapper:
+            raise ValueError("结构化记忆 JSON 的 items 必须是数组")
+        return None
+    if len(candidates) > _STRUCTURED_IMPORT_MAX_ITEMS:
+        raise ValueError(
+            "结构化记忆 JSON 条目过多："
+            f"{len(candidates)} > {_STRUCTURED_IMPORT_MAX_ITEMS}"
+        )
+    if not candidates:
+        return []
+
+    marker_fields = {
+        "name", "domain", "valence", "arousal", "tags", "importance"
+    }
+    known_conversation_fields = {"chat_messages", "mapping", "messages"}
+    if not explicit_wrapper and any(
+        isinstance(item, dict)
+        and known_conversation_fields.intersection(item)
+        for item in candidates
+    ):
+        return None
+    dictionary_items = all(
+        isinstance(item, dict) and "role" not in item for item in candidates
+    )
+    declared_memory_fields = any(
+        isinstance(item, dict) and bool(marker_fields.intersection(item))
+        for item in candidates
+    )
+    if not explicit_wrapper and not (
+        dictionary_items and declared_memory_fields
+    ):
+        return None
+
+    return ImportEngine._parse_extraction(
+        json.dumps(candidates, ensure_ascii=False),
+        max_items=_STRUCTURED_IMPORT_MAX_ITEMS,
+        strict=True,
+    )
 
 
 async def _await_import_worker(func, *args):
@@ -636,6 +702,46 @@ def preview_import(raw_content: str, filename: str = "", human_label: str = "用
             "warnings": ["文件为空"],
         }
 
+    try:
+        direct_items = _parse_structured_memory_json(raw_content, filename)
+    except ValueError as exc:
+        return {
+            "ok": False,
+            "error": _safe_import_error_detail(exc),
+            "detected_format": "structured_memory_json",
+            "turns_count": 0,
+            "chunks_count": 0,
+            "estimated_api_calls": 0,
+            "requires_llm": False,
+            "warnings": warnings,
+        }
+    if direct_items is not None:
+        if not direct_items:
+            return {
+                "ok": False,
+                "error": "结构化记忆 JSON 中没有可导入条目",
+                "detected_format": "structured_memory_json",
+                "turns_count": 0,
+                "chunks_count": 0,
+                "estimated_api_calls": 0,
+                "requires_llm": False,
+                "warnings": warnings,
+            }
+        return {
+            "ok": True,
+            "detected_format": "structured_memory_json",
+            "turns_count": len(direct_items),
+            "chunks_count": len(direct_items),
+            "estimated_api_calls": 0,
+            "estimated_tokens": 0,
+            "requires_llm": False,
+            "warnings": warnings,
+            "first_chunk_preview": json.dumps(
+                direct_items[0], ensure_ascii=False, indent=2
+            )[:600],
+            "sample_turns": [],
+        }
+
     detected_format = _detect_preview_format(raw_content, filename, warnings)
     turns = detect_and_parse(raw_content, filename)
     if not turns:
@@ -669,6 +775,7 @@ def preview_import(raw_content: str, filename: str = "", human_label: str = "用
         "turns_count": len(turns),
         "chunks_count": len(chunks),
         "estimated_api_calls": len(chunks),
+        "requires_llm": True,
         "estimated_tokens": token_estimate,
         "warnings": warnings,
         "first_chunk_preview": first_preview,
@@ -944,16 +1051,6 @@ class ImportEngine:
         resume_state_loaded = bool(resume and self.state.load())
         state_initialized = resume_state_loaded
         try:
-            # 预检：LLM API 必须可用，否则所有 chunk 都会静默失败。
-            # 该检查必须在 reservation 的 try/finally 内，失败时也要释放槽位。
-            if not self.dehydrator.api_available:
-                return self._record_start_error(
-                    job_id=job_id,
-                    filename=filename,
-                    message="LLM API 未配置或不可用，导入需要 OMBRE_COMPRESS_API_KEY。请检查 config.yaml 或环境变量。",
-                    keep_progress=resume_state_loaded,
-                )
-
             _human = self.config.get("human", "用户")
             # source_hash 必须把 human_label 也算进去：chunk_turns() 把它拼进每一行
             # 再数 token，边界完全由它决定。只按 raw_content 算哈希的话，暂停期间
@@ -970,6 +1067,17 @@ class ImportEngine:
                 str(_human),
             )
             raw_content = ""
+
+            direct_import = bool(
+                prepared_chunks and "direct_item" in prepared_chunks[0]
+            )
+            if not direct_import and not self.dehydrator.api_available:
+                return self._record_start_error(
+                    job_id=job_id,
+                    filename=filename,
+                    message="LLM API 未配置或不可用，历史对话导入需要 OMBRE_COMPRESS_API_KEY。请检查 config.yaml 或环境变量。",
+                    keep_progress=resume_state_loaded,
+                )
 
             # 检查是否续传
             if resume_state_loaded and self.state.can_resume:
@@ -1045,7 +1153,8 @@ class ImportEngine:
             self.state.data["job_id"] = job_id
             if len(self.state.data["errors"]) < _STATE_ERR_LOG_MAX:
                 self.state.data["errors"].append(
-                    f"导入准备失败（{type(e).__name__}）"
+                    f"导入准备失败（{type(e).__name__}）："
+                    f"{_safe_import_error_detail(e)}"
                 )
             self.state.save()
             raise
@@ -1136,71 +1245,57 @@ class ImportEngine:
             )
 
     async def _create_import_bucket(self, item: dict) -> str:
-        """在普通高重要度配额内创建一条导入记忆。"""
+        """创建一条导入记忆；importance 只是普通评分字段，不设硬配额。"""
         requested_importance = item.get(
             "importance", _DEFAULT_IMPORTANCE
         )
-
-        async def create(
-            final_importance: int,
-            *,
-            defer_derived_index: bool = False,
-        ) -> str:
-            return await self.bucket_mgr.create(
-                content=item["content"],
-                tags=item.get("tags", []),
-                importance=final_importance,
-                domain=item.get("domain", ["未分类"]),
-                valence=item.get("valence", _DEFAULT_VALENCE),
-                arousal=item.get("arousal", _DEFAULT_AROUSAL),
-                name=item.get("name") or None,
-                source_tool="import",
-                imported=True,
-                defer_derived_index=defer_derived_index,
-            )
-
-        if requested_importance >= _HIGH_IMP_THRESHOLD:
-            async with _quota_turn("high_importance"):
-                final_importance = await enforce_high_importance_quota(
-                    requested_importance,
-                    bucket_mgr=self.bucket_mgr,
-                )
-                bucket_id = await create(
-                    final_importance,
-                    defer_derived_index=True,
-                )
-            post_index = getattr(
-                self.bucket_mgr, "_index_after_update", None
-            )
-            if callable(post_index):
-                await post_index(bucket_id, content_changed=True)
-            return bucket_id
-        return await create(requested_importance)
+        return await self.bucket_mgr.create(
+            content=item["content"],
+            tags=item.get("tags", []),
+            importance=requested_importance,
+            domain=item.get("domain", ["未分类"]),
+            valence=item.get("valence", _DEFAULT_VALENCE),
+            arousal=item.get("arousal", _DEFAULT_AROUSAL),
+            name=item.get("name") or None,
+            source_tool="import",
+            event_actor="human",
+            imported=True,
+        )
 
     async def _process_single_chunk(self, chunk: dict, preserve_raw: bool) -> bool:
         """Extract memories from a single chunk and store them."""
-        content = chunk["content"]
+        direct_item = chunk.get("direct_item")
+        if isinstance(direct_item, dict):
+            items = [direct_item]
+        else:
+            items = None
+
+        if items is not None:
+            content = str(direct_item.get("content") or "")
+        else:
+            content = chunk["content"]
         if not content.strip():
             return True
 
         # --- LLM extraction ---
-        try:
-            items = await self._extract_memories(content)
-            self.state.data["api_calls"] += 1
-        except Exception as e:
-            err_msg = (
-                f"LLM 提取失败（{type(e).__name__}）："
-                f"{_safe_import_error_detail(e)}"
-            )
-            logger.warning(
-                "Import extraction failed: err_type=%s detail=hidden",
-                type(e).__name__,
-            )
-            self.state.data["api_calls"] += 1
-            # 把 LLM 失败原因写入 state.errors，让 /api/import/status 可见
-            if len(self.state.data["errors"]) < _STATE_ERR_LOG_MAX:
-                self.state.data["errors"].append(err_msg)
-            return False
+        if items is None:
+            try:
+                items = await self._extract_memories(content)
+                self.state.data["api_calls"] += 1
+            except Exception as e:
+                err_msg = (
+                    f"LLM 提取失败（{type(e).__name__}）："
+                    f"{_safe_import_error_detail(e)}"
+                )
+                logger.warning(
+                    "Import extraction failed: err_type=%s detail=hidden",
+                    type(e).__name__,
+                )
+                self.state.data["api_calls"] += 1
+                # 把 LLM 失败原因写入 state.errors，让 /api/import/status 可见
+                if len(self.state.data["errors"]) < _STATE_ERR_LOG_MAX:
+                    self.state.data["errors"].append(err_msg)
+                return False
 
         if not items:
             return True
@@ -1282,7 +1377,12 @@ class ImportEngine:
         return self._parse_extraction(raw)
 
     @staticmethod
-    def _parse_extraction(raw: str) -> list[dict]:
+    def _parse_extraction(
+        raw: str,
+        *,
+        max_items: int = _EXTRACT_MAX_ITEMS,
+        strict: bool = False,
+    ) -> list[dict]:
         """Parse and validate LLM extraction result."""
         try:
             cleaned = _strip_md_fence(raw)
@@ -1300,10 +1400,21 @@ class ImportEngine:
 
         validated = []
         truncated = False
-        for item in items:
-            if not isinstance(item, dict) or not item.get("content"):
+        for index, item in enumerate(items):
+            valid_content = isinstance(item, dict) and bool(item.get("content"))
+            if strict:
+                valid_content = (
+                    valid_content
+                    and isinstance(item.get("content"), str)
+                    and bool(item["content"].strip())
+                )
+            if not valid_content:
+                if strict:
+                    raise ValueError(
+                        f"结构化记忆第 {index + 1} 项必须是含非空 content 的对象"
+                    )
                 continue
-            if len(validated) >= _EXTRACT_MAX_ITEMS:
+            if len(validated) >= max_items:
                 truncated = True
                 break
             importance = _clamp_importance(item)
@@ -1345,7 +1456,7 @@ class ImportEngine:
             logger.warning(
                 "Import extraction item cap applied: returned=%s accepted=%s",
                 len(items),
-                _EXTRACT_MAX_ITEMS,
+                max_items,
             )
         return validated
 
@@ -1390,7 +1501,8 @@ class ImportEngine:
         all_buckets = await self.bucket_mgr.list_all(include_archive=False)
         dynamic_buckets = [
             b for b in all_buckets
-            if b["metadata"].get("type") == "dynamic"
+            if not is_letter_bucket(b)
+            and b["metadata"].get("type") == "dynamic"
             and not b["metadata"].get("pinned")
             and not b["metadata"].get("resolved")
         ]
