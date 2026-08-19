@@ -8,21 +8,21 @@ from pathlib import Path
 from typing import Any
 
 
+# 3.2.0 主连接器只保留 13 个记忆动作；信件已迁到 /mcp-extra，
+# source_read 已从公开 MCP 删除，feel 成为主连接器工具。
 EXPECTED_TOOLS = {
     "breath",
     "breath_search",
     "breath_advanced",
     "hold",
     "grow",
-    "source_read",
     "trace",
+    "dream",
+    "feel",
     "anchor",
     "release",
     "pulse",
     "plan",
-    "letter_write",
-    "letter_read",
-    "dream",
     "I",
 }
 TARGET_ID = "smoke-delete-001"
