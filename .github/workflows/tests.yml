@@ -2,13 +2,13 @@ name: Tests
 
 on:
   push:
-    branches: [main, testing]
+    branches: [main, testing, production]
     paths-ignore:
       - '*.md'
       - 'backup_*/**'
       - '.gitignore'
   pull_request:
-    branches: [main, testing]
+    branches: [main, testing, production]
 
 jobs:
   test:
