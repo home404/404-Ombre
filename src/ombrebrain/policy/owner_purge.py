@@ -50,6 +50,7 @@ _NEGATIVE_ONE_FIELDS = {
     "importance",
     "resolved",
     "pinned",
+    "protected",
     "digested",
     "weight",
     "dont_surface",

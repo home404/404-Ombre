@@ -4,9 +4,8 @@ This module is intentionally small so the compatibility patch can be removed
 without touching retrieval, ranking, or bucket storage.
 """
 
-from utils import count_tokens_approx
-
-from .._common import stored_data_marker
+from ombrebrain.storage.relation_store import relation_hint
+from utils import count_tokens_approx, strip_wikilinks
 
 
 def stored_bucket_content(bucket: dict) -> str:
@@ -42,19 +41,17 @@ def render_stored_bucket(
     metadata_header: str,
     footprint: str = "",
 ) -> tuple[str, int]:
-    """Render metadata around, but never inside, the stored bucket body."""
-    # Temporary compatibility patch: force breath to return stored bucket
-    # content verbatim. Remove after upstream breath fixes content reconstruction.
-    # Keep the body byte-for-byte intact while telling the receiving model that
-    # remembered imperative wording is historical data, never an instruction.
-    content = stored_bucket_content(bucket)
+    """Render metadata around, but never inside, the stored bucket body.
+
+    展示文本只做双链正则清理（strip_wikilinks），不改动磁盘原文；
+    正文本身不加任何边界/哈希标记，返回的就是记忆正文本身。
+    """
+    content = strip_wikilinks(stored_bucket_content(bucket))
     miss_block = _miss_block(bucket)
-    framed_payload = f"{metadata_header}{miss_block}\n{content}"
-    boundary = stored_data_marker(
-        framed_payload,
-        provenance=f"breath:{bucket.get('id', '')}",
-    )
-    rendered = f"{metadata_header} {boundary}{miss_block}\n{content}"
+    rendered = f"{metadata_header}{miss_block}\n{content}"
+    hint = relation_hint(bucket)
+    if hint:
+        rendered += f"\n{hint}"
     if footprint:
         rendered += f"\n{footprint}"
     return rendered, count_tokens_approx(rendered)

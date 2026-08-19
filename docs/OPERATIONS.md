@@ -71,7 +71,7 @@ python tools/check_buckets.py --json
 2. 准备一个全新的临时 vault/测试实例，不要直接覆盖唯一的生产目录。
 3. 在迁移页面上传 ZIP。新包应显示“备份清单与 SHA-256 校验通过”；无清单旧包会显示“未验证”，有原文引用但缺证据的 v2.10.0 包会显示兼容性警告。
 4. 检查 bucket 数、冲突决策和 embedding 模型/维度，再执行导入。
-5. 导入完成后运行 `python tools/check_buckets.py`，并用 `breath_search(query=...)` 抽查可检索性；若测试包含原文证据，再用准确桶 ID + 标题调用一次 `source_read(scope="event")`，确认事件范围可读且未带出范围外文字。
+5. 导入完成后运行 `python tools/check_buckets.py`，并用 `breath_search(query=...)` 抽查可检索性；若测试包含原文证据，检查 `<vault>/_sources/` 下的 `.source` 文件已随导入落盘（3.0.0 起没有回读工具，原文只能从磁盘核对）。
 6. 确认 outbox 待处理数最终回到 0。模型离线时允许保持 pending，但 Markdown 必须完整可读。
 
 导入冲突的语义：
@@ -177,7 +177,7 @@ docker compose -f deploy/docker-compose.yml up -d --build --force-recreate
 
 `entrypoint.sh` 本身来自镜像，不在 Dashboard 热更新覆盖范围内。升级到带有新播种逻辑的版本时必须先拉取/重建镜像一次，不能只点击 Dashboard 更新。
 
-Dashboard 热更新会限制下载包、成员数、单文件大小、总解压量和压缩率。建立 `_prev` 回滚点失败时不会继续覆盖；逐文件写入采用原子替换。依赖变化以正式发布使用的 `requirements.lock.txt` 为准，旧更新包缺少锁文件时才回退 `requirements.txt`；真实依赖变化且未显式开启 `OMBRE_UPDATE_ALLOW_PIP=1` 时，热更新会回滚并要求重建镜像，避免“代码更新成功但重启后缺包”。
+Dashboard 热更新会限制下载包、成员数、单文件大小、总解压量和压缩率。建立 `_prev` 回滚点失败时不会继续覆盖；逐文件写入采用原子替换。依赖变化以正式发布使用的 `requirements.lock.txt` 为准，旧更新包缺少锁文件时才回退 `requirements.txt`；真实依赖变化且未显式开启 `OMBRE_UPDATE_ALLOW_PIP=1`（或 Dashboard 「热更新」面板里的等效开关）时，热更新会在写入任何文件前直接拒绝并要求重建镜像，避免”代码更新成功但重启后缺包”——2.16.2 起这道检查提前到下载/解析完依赖清单之后、真正覆盖 src/frontend 之前，不会再出现”先备份写文件、再整体回滚”的多余一轮。
 
 已经停留在 2.8.4、且出现“新版依赖清单有变化”回滚提示的实例，可以直接重新点击官方 `main` 热更新。官方 GitHub 归档通过 `.gitattributes` 排除仅供开发者使用的宽松 `requirements.txt`，同时保留带 hash 的 `requirements.lock.txt`；旧更新器会跳过错误的源清单比较，新更新器接管后则继续按发布锁判断。自建镜像/镜像站若重新打包了根级 `requirements.txt`，仍应重建镜像，或仅在明确理解风险时临时设置 `OMBRE_UPDATE_ALLOW_PIP=1`。
 

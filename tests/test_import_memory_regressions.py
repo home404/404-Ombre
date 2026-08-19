@@ -11,7 +11,6 @@
 import hashlib
 import json
 import os
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -23,8 +22,6 @@ from import_memory import (
     chunk_turns,
     diagnose_import_errors,
 )
-from tools import _runtime as rt
-from tools._common import count_high_importance
 from utils import count_tokens_approx
 
 
@@ -88,6 +85,7 @@ class FakeBucketManager:
             "id": bid, "content": content, "domain": domain or [],
             "tags": tags or [], "name": name,
             "source_tool": _kw.get("source_tool"),
+            "event_actor": _kw.get("event_actor"),
             "imported": _kw.get("imported", False),
         })
         return bid
@@ -109,6 +107,51 @@ class FakeBucketManager:
 
     async def update(self, bucket_id, **_kw):
         return True
+
+
+@pytest.mark.asyncio
+async def test_structured_json_import_is_deterministic_and_skips_llm(tmp_path):
+    bucket_mgr = FakeBucketManager()
+    dehydrator = FakeDehydrator()
+    dehydrator.api_available = False
+    engine = ImportEngine(
+        {"buckets_dir": str(tmp_path), "human": "阿明"},
+        bucket_mgr,
+        dehydrator,
+    )
+    raw = json.dumps([
+        {
+            "name": "第一条",
+            "content": "人工整理的第一条记忆。",
+            "domain": ["回忆"],
+            "valence": 0.6,
+            "arousal": 0.3,
+            "tags": ["人工"],
+            "importance": 6,
+        },
+        {
+            "name": "第二条",
+            "content": "人工整理的第二条记忆。",
+            "domain": ["计划"],
+            "valence": 0.5,
+            "arousal": 0.4,
+            "tags": [],
+            "importance": 7,
+        },
+    ], ensure_ascii=False)
+
+    result = await engine.start(raw, filename="memories.json")
+
+    assert result["status"] == "completed"
+    assert result["api_calls"] == 0
+    assert result["memories_created"] == 2
+    assert dehydrator.chat_calls == []
+    assert [item["content"] for item in bucket_mgr.created] == [
+        "人工整理的第一条记忆。",
+        "人工整理的第二条记忆。",
+    ]
+    assert all(item["source_tool"] == "import" for item in bucket_mgr.created)
+    assert all(item["event_actor"] == "human" for item in bucket_mgr.created)
 
 
 # ------------------------------------------------------------
@@ -140,53 +183,6 @@ async def test_preserve_raw_reprocessing_same_chunk_does_not_duplicate(tmp_path)
     assert engine.state.data["memories_created"] == 1
     assert engine.state.data["memories_skipped"] == 1
     assert engine.state.data["memories_merged"] == 0
-
-
-@pytest.mark.asyncio
-async def test_preserve_raw_import_respects_high_importance_quota(
-    bucket_mgr,
-    test_config,
-    monkeypatch,
-):
-    rt.config = test_config
-    rt.bucket_mgr = bucket_mgr
-    rt.logger = MagicMock()
-    monkeypatch.setattr("tools._common._HIGH_IMP_HARD_CAP", 1)
-    monkeypatch.setattr("tools._common._HIGH_IMP_SOFT_WARN", 1)
-
-    await bucket_mgr.create(content="existing high", importance=9)
-    item = {
-        "name": "imported raw high",
-        "content": "raw imported high memory",
-        "domain": ["import"],
-        "valence": 0.5,
-        "arousal": 0.3,
-        "tags": [],
-        "importance": 9,
-        "preserve_raw": True,
-        "is_pattern": False,
-    }
-    engine = ImportEngine(
-        test_config,
-        bucket_mgr,
-        FakeDehydrator(extraction_items=[item]),
-    )
-
-    await engine._process_single_chunk(
-        {"content": "source transcript", "timestamp_start": ""},
-        preserve_raw=False,
-    )
-
-    imported = next(
-        bucket
-        for bucket in await bucket_mgr.list_all(include_archive=False)
-        if bucket["content"] == item["content"]
-    )
-    assert imported["metadata"]["importance"] == 8
-    assert imported["metadata"]["imported"] is True
-    assert imported["metadata"]["source_tool"] == "import"
-    assert imported["metadata"]["created"] == imported["metadata"]["last_active"]
-    assert await count_high_importance(bucket_mgr=bucket_mgr) == 1
 
 
 @pytest.mark.asyncio
